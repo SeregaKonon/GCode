@@ -1,0 +1,94 @@
+--Link server where DB(orginal) located
+
+--=============================================================================
+declare @BackupSrc nvarchar(128) = 'd:\BackUp\'--Backup Path, where exist BAckup of oiginal backup
+declare @RestoreSrc nvarchar(128) = 'd:\mssql\'--Path where will be located mdf,ndf,ldf files of DB copy
+declare @DBName nvarchar(128)= 'mis_new'--Name Db wich need to restore on linken server
+
+
+IF OBJECT_ID('tempdb..#SrcBAckup') IS NOT NULL DROP Table #SrcBAckup
+select 
+		replace(b.physical_device_name,'y:\',@BackupSrc) as physical_device_name
+		,a.backup_finish_date
+		,CASE a.[type] 
+		 WHEN 'D' THEN 'Full'
+		 WHEN 'I' THEN 'Differential'
+		 WHEN 'L' THEN 'Transaction Log'
+		 ELSE a.[type]
+		END as BackupType
+into #SrcBAckup
+from [linkServer_IP].msdb.dbo.backupset a
+join [linkServer_IP].msdb.dbo.backupmediafamily b
+on a.media_set_id = b.media_set_id
+where a.database_name=@DBName and (a.type = 'I' or a.type='D')
+
+
+
+IF OBJECT_ID('tempdb..#FileGroups') IS NOT NULL DROP Table #FileGroups
+
+select
+	ROW_NUMBER() over (order by mf.name) id,
+	mf.name,mf.type_desc
+into #FileGroups
+from [linkServer_IP].msdb.sys.master_files mf
+join [linkServer_IP].msdb.sys.databases d on d.database_id=mf.database_id
+where d.name =@DBName
+
+	DECLARE @UnionRows VARCHAR(8000) 
+	
+	SELECT 
+		@UnionRows  = 
+		COALESCE(@UnionRows   + ', ', '') + 'move '''+
+		name
+		+''' to '''+
+		case  
+			when type_desc='ROWS' and id=1 then @RestoreSrc+name+'_copy'+ +'.mdf'''
+			when type_desc='ROWS' then @RestoreSrc+name+'_copy'+ +'.ndf'''
+			when type_desc='LOG' then @RestoreSrc+name+'_copy'+'.ldf'''
+		end 
+	FROM #FileGroups
+	
+	
+	
+	declare @SQLEXEC_FULL nvarchar(max) = (
+	select  top 1
+	'restore database '+@DBName+'_copy' + ' from disk = '''+src.physical_device_name+'''
+	with
+	'+@UnionRows+', 
+	stats=1,replace,norecovery'
+	from #SrcBAckup src
+	where src.BackupType='FULL'
+	order by src.backup_finish_date desc)
+
+
+declare @SQLEXEC_DIFF nvarchar(max)
+if (select max(backup_finish_date) from #SrcBAckup where BackupType='FULL')<(select max(backup_finish_date) from #SrcBAckup where BackupType='Differential')
+begin
+	set @SQLEXEC_DIFF= (
+	select  top 1
+	'restore database '+@DBName+'_copy' + ' from disk = '''+src.physical_device_name+'''
+	with
+	'+@UnionRows+', 
+	stats=1,replace,recovery'
+	from #SrcBAckup src
+	where src.BackupType='Differential'
+	order by src.backup_finish_date desc)
+end
+else set @SQLEXEC_DIFF = 'restore database '+@DBName+'_copy with recovery'
+
+
+
+begin try
+select @SQLEXEC_FULL,@SQLEXEC_DIFF
+	exec(@SQLEXEC_FULL)
+	exec(@SQLEXEC_DIFF)
+end try
+begin catch
+	select ERROR_NUMBER() as Error
+	select * FROM #FileGroups
+	select * from #SrcBAckup src
+	select 'Мувы - ' ,@UnionRows
+	select 'SQL FULL RESTORE - ', @SQLEXEC_FULL
+	select 'SQL DIFF RESTORE - ',@SQLEXEC_DIFF
+end catch
+
